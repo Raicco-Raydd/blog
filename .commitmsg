@@ -1,0 +1,5 @@
+feat: 博客静态生成器上线
+
+- 自研生成器（Node.js + markdown-it + gray-matter）
+- 首页列表 / 文章页 / 标签页 / RSS
+- GitHub Actions 自动构建部署 Pages
