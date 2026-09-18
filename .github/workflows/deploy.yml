@@ -1,0 +1,97 @@
+name: Deploy blog to raicco.cn
+
+# 触发方式：
+#   push 到 main        → 自动构建并部署
+#   手动触发            → Actions 页面点 "Run workflow"
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# 同一时间只跑一个部署，新的 push 会取消进行中的旧任务
+concurrency:
+  group: deploy-blog
+  cancel-in-progress: true
+
+# 只读仓库内容即可，不需要写权限（我们不用 GitHub Pages）
+permissions:
+  contents: read
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Build site
+        run: node build.js
+
+      - name: Verify build output
+        run: |
+          echo "构建产物："
+          find dist -type f | sort
+          test -f dist/index.html || { echo "缺少 dist/index.html，构建失败"; exit 1; }
+
+      - name: Setup SSH
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.DEPLOY_SSH_KEY }}
+
+      - name: Trust server host key
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          # 从 GitHub Secrets 读取服务器主机公钥指纹，避免 TOFU 提示
+          # 若未配置该 secret，则退回 accept-new（首次自动接受）
+          if [ -n "${{ secrets.SSH_KNOWN_HOSTS }}" ]; then
+            echo "${{ secrets.SSH_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+            chmod 600 ~/.ssh/known_hosts
+            echo "已使用预置的 known_hosts"
+          else
+            echo "未配置 SSH_KNOWN_HOSTS，使用 StrictHostKeyChecking=accept-new"
+          fi
+
+      - name: Deploy via rsync
+        run: |
+          rsync -acz --delete \
+            -e "ssh -o StrictHostKeyChecking=accept-new" \
+            dist/ \
+            ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}:/var/www/blog/
+
+      - name: Fix owner and permissions
+        run: |
+          ssh -o StrictHostKeyChecking=accept-new \
+            ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }} \
+            "sudo chown -R www-data:www-data /var/www/blog && sudo chmod -R a+rX /var/www/blog"
+
+      - name: Verify deployment
+        run: |
+          code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 https://blog.raicco.cn/)
+          echo "https://blog.raicco.cn/ -> HTTP $code"
+          if [ "$code" != "200" ]; then
+            echo "部署后验证失败：期望 200，实际 $code"
+            exit 1
+          fi
+          echo "部署成功"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## 部署结果"
+            echo ""
+            echo "- 站点: https://blog.raicco.cn"
+            echo "- 提交: \`${{ github.sha }}\`"
+            echo "- 触发: ${{ github.event_name }}"
+            echo "- 状态: ${{ job.status }}"
+          } >> $GITHUB_STEP_SUMMARY
