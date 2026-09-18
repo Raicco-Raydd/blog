@@ -8,12 +8,11 @@ on:
     branches: [main]
   workflow_dispatch:
 
-# 同一时间只跑一个部署，新的 push 会取消进行中的旧任务
+# 同一时间只跑一个部署；新的 push 会取消进行中的旧任务
 concurrency:
   group: deploy-blog
   cancel-in-progress: true
 
-# 只读仓库内容即可，不需要写权限（我们不用 GitHub Pages）
 permissions:
   contents: read
 
@@ -36,53 +35,88 @@ jobs:
       - name: Build site
         run: node build.js
 
+      # 写入部署标记。用途见 Verify deployment 一步：
+      # 它是"这次部署到底有没有生效"的唯一可信证据。
+      - name: Write deploy marker
+        run: |
+          {
+            echo "commit=${{ github.sha }}"
+            echo "run=${{ github.run_number }}"
+            echo "built_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          } > dist/deployed.txt
+          cat dist/deployed.txt
+
       - name: Verify build output
         run: |
           echo "构建产物："
           find dist -type f | sort
-          test -f dist/index.html || { echo "缺少 dist/index.html，构建失败"; exit 1; }
+          test -f dist/index.html || { echo "缺少 dist/index.html"; exit 1; }
 
       - name: Setup SSH
         uses: webfactory/ssh-agent@v0.9.0
         with:
           ssh-private-key: ${{ secrets.DEPLOY_SSH_KEY }}
 
-      - name: Trust server host key
+      - name: Configure known_hosts
+        env:
+          KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
         run: |
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
-          # 从 GitHub Secrets 读取服务器主机公钥指纹，避免 TOFU 提示
-          # 若未配置该 secret，则退回 accept-new（首次自动接受）
-          if [ -n "${{ secrets.SSH_KNOWN_HOSTS }}" ]; then
-            echo "${{ secrets.SSH_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          if [ -n "$KNOWN_HOSTS" ]; then
+            printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
             chmod 600 ~/.ssh/known_hosts
-            echo "已使用预置的 known_hosts"
+            echo "known_hosts configured from secret"
           else
-            echo "未配置 SSH_KNOWN_HOSTS，使用 StrictHostKeyChecking=accept-new"
+            echo "SSH_KNOWN_HOSTS not set; will use StrictHostKeyChecking=accept-new"
           fi
 
       - name: Deploy via rsync
+        env:
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
         run: |
+          # -a: archive (preserve perms/times, recursive)
+          # -c: compare by checksum, not size+mtime
+          # -z: compress in transit
+          # --delete: remove files on the server that no longer exist locally
           rsync -acz --delete \
             -e "ssh -o StrictHostKeyChecking=accept-new" \
             dist/ \
-            ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}:/var/www/blog/
+            "${DEPLOY_USER}@${DEPLOY_HOST}:/var/www/blog/"
 
       - name: Fix owner and permissions
+        env:
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
         run: |
           ssh -o StrictHostKeyChecking=accept-new \
-            ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }} \
+            "${DEPLOY_USER}@${DEPLOY_HOST}" \
             "sudo chown -R www-data:www-data /var/www/blog && sudo chmod -R a+rX /var/www/blog"
 
+      # 真正的验证：把本次提交写入的标记文件从公网取回并核对。
+      #
+      # 为什么不只检查 HTTP 200：
+      #   站点早就上线了，HTTP 200 只能证明"站点活着"，
+      #   无法证明"本次 rsync 真的生效了"。那是假阳性。
+      #   核对 deployed.txt 里的 commit 才能证明整条链路打通。
       - name: Verify deployment
         run: |
-          code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 https://blog.raicco.cn/)
-          echo "https://blog.raicco.cn/ -> HTTP $code"
-          if [ "$code" != "200" ]; then
-            echo "部署后验证失败：期望 200，实际 $code"
-            exit 1
-          fi
-          echo "部署成功"
+          echo "期望 commit: ${{ github.sha }}"
+          for i in 1 2 3 4 5; do
+            body=$(curl -s --max-time 15 -H 'Cache-Control: no-cache' \
+                   "https://blog.raicco.cn/deployed.txt?cb=$RANDOM" || true)
+            echo "--- 尝试 $i ---"
+            echo "$body"
+            if echo "$body" | grep -q "${{ github.sha }}"; then
+              echo "验证通过：线上 deployed.txt 与本次提交一致"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "验证失败：线上 deployed.txt 未包含本次 commit"
+          echo "可能原因：rsync 目标路径错误、权限问题、或 CDN/浏览器缓存"
+          exit 1
 
       - name: Summary
         if: always()
@@ -90,8 +124,10 @@ jobs:
           {
             echo "## 部署结果"
             echo ""
-            echo "- 站点: https://blog.raicco.cn"
-            echo "- 提交: \`${{ github.sha }}\`"
-            echo "- 触发: ${{ github.event_name }}"
-            echo "- 状态: ${{ job.status }}"
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| 站点 | https://blog.raicco.cn |"
+            echo "| commit | \`${{ github.sha }}\` |"
+            echo "| 触发方式 | ${{ github.event_name }} |"
+            echo "| 状态 | ${{ job.status }} |"
           } >> $GITHUB_STEP_SUMMARY
