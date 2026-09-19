@@ -76,23 +76,59 @@ jobs:
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
         run: |
-          # -a: archive (preserve perms/times, recursive)
-          # -c: compare by checksum, not size+mtime
-          # -z: compress in transit
-          # --delete: remove files on the server that no longer exist locally
-          rsync -acz --delete \
+          # -a  archive: recursive + preserve times/symlinks
+          # -c  compare by checksum instead of size+mtime
+          # -z  compress in transit
+          # --delete  remove server files that no longer exist locally
+          #
+          # --chmod sets explicit target permissions (D=dir, F=file).
+          # Without it, -a copies the source modes, which for Windows-derived
+          # artifacts are 666/777 -- world-writable, wrong for a web root.
+          #
+          # IMPORTANT: do NOT chown -R the target to www-data afterwards.
+          # That takes write permission away from the deploy user, so the NEXT
+          # deploy fails with rsync exit 23 (partial transfer due to error) when
+          # it tries to delete or overwrite files it no longer owns.
+          # www-data only needs to READ this tree, so rsync's own permissions
+          # plus a readable directory are sufficient.
+          set +e
+          rsync -acz --delete --chmod=D755,F644 \
             -e "ssh -o StrictHostKeyChecking=accept-new" \
             dist/ \
             "${DEPLOY_USER}@${DEPLOY_HOST}:/var/www/blog/"
+          rc=$?
+          set -e
 
-      - name: Fix owner and permissions
+          if [ $rc -ne 0 ]; then
+            echo "::error::rsync exited with code $rc"
+            case $rc in
+              23) echo "23 = partial transfer due to error (usually permission denied on target files)";;
+              12) echo "12 = protocol/data stream error";;
+              11) echo "11 = file I/O error";;
+              10) echo "10 = socket I/O error";;
+              5)  echo "5  = client-server protocol error";;
+              3)  echo "3  = errors selecting input files";;
+            esac
+            echo "--- target directory state ---"
+            ssh -o StrictHostKeyChecking=accept-new \
+              "${DEPLOY_USER}@${DEPLOY_HOST}" \
+              "ls -la /var/www/blog/ | head -20; echo; id" || true
+            exit $rc
+          fi
+          echo "rsync completed with exit code 0"
+
+      # www-data only needs read access. If an earlier deploy left the tree owned
+      # by another account, fix ownership -- but only on the directory entry
+      # (non-recursive) so the deploy user keeps write permission for next time.
+      - name: Ensure web server can read the tree
         env:
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
         run: |
           ssh -o StrictHostKeyChecking=accept-new \
             "${DEPLOY_USER}@${DEPLOY_HOST}" \
-            "sudo chown -R www-data:www-data /var/www/blog && sudo chmod -R a+rX /var/www/blog"
+            "sudo chown www-data:www-data /var/www/blog && sudo find /var/www/blog -type d -exec chmod 755 {} +"
+          echo "web root is readable by www-data"
 
       # 真正的验证：把本次提交写入的标记文件从公网取回并核对。
       #
