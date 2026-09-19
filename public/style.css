@@ -121,3 +121,19 @@ body {
   color: var(--muted);
   font-size: 0.85em;
 }
+
+.site-footer p {
+  margin: 0.25em 0;
+}
+
+/* 备案号：按工信部要求在页面底部展示，并链接至 beian.miit.gov.cn */
+.site-beian a {
+  color: var(--muted);
+  text-decoration: none;
+  border-bottom: 1px dotted var(--muted);
+}
+
+.site-beian a:hover {
+  color: var(--text);
+  border-bottom-color: var(--text);
+}
