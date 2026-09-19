@@ -20,6 +20,11 @@ jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
 
+    env:
+      SITE: blog
+      DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+      DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -35,8 +40,8 @@ jobs:
       - name: Build site
         run: node build.js
 
-      # 写入部署标记。用途见 Verify deployment 一步：
-      # 它是"这次部署到底有没有生效"的唯一可信证据。
+      # 部署标记文件。它是"这次部署到底有没有生效"的唯一可信证据：
+      # Verify 步骤会从公网把它取回来，核对 commit 是否与本次提交一致。
       - name: Write deploy marker
         run: |
           {
@@ -68,73 +73,65 @@ jobs:
             chmod 600 ~/.ssh/known_hosts
             echo "known_hosts configured from secret"
           else
-            echo "SSH_KNOWN_HOSTS not set; will use StrictHostKeyChecking=accept-new"
+            echo "SSH_KNOWN_HOSTS not set; using StrictHostKeyChecking=accept-new"
           fi
 
-      - name: Deploy via rsync
-        env:
-          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
-          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+      # 把产物打包上传到服务器暂存目录。
+      #
+      # 为什么用 tar 而不是直接 rsync：
+      #   部署流程包含「内容同步 + 权限规范化」两步，两者顺序不能错。
+      #   真正的逻辑放在服务器上的 /usr/local/bin/deploy-static-site，
+      #   所有部署路径（Actions、本地脚本）共用同一份实现，
+      #   避免某一边漏掉权限处理导致 rsync 退出码 23。
+      #
+      #   历史教训：曾把 chown -R www-data 直接写在 workflow 里，
+      #   结果目录属主变成 www-data，部署用户失去写权限，
+      #   第一次成功、之后每次都失败。
+      - name: Upload artifacts to staging
         run: |
-          # -a  archive: recursive + preserve times/symlinks
-          # -c  compare by checksum instead of size+mtime
-          # -z  compress in transit
-          # --delete  remove server files that no longer exist locally
-          #
-          # --chmod sets explicit target permissions (D=dir, F=file).
-          # Without it, -a copies the source modes, which for Windows-derived
-          # artifacts are 666/777 -- world-writable, wrong for a web root.
-          #
-          # IMPORTANT: do NOT chown -R the target to www-data afterwards.
-          # That takes write permission away from the deploy user, so the NEXT
-          # deploy fails with rsync exit 23 (partial transfer due to error) when
-          # it tries to delete or overwrite files it no longer owns.
-          # www-data only needs to READ this tree, so rsync's own permissions
-          # plus a readable directory are sufficient.
-          set +e
-          rsync -acz --delete --chmod=D755,F644 \
-            -e "ssh -o StrictHostKeyChecking=accept-new" \
-            dist/ \
-            "${DEPLOY_USER}@${DEPLOY_HOST}:/var/www/blog/"
-          rc=$?
-          set -e
+          tar czf /tmp/site.tgz -C dist .
+          scp -o StrictHostKeyChecking=accept-new \
+            /tmp/site.tgz \
+            "${DEPLOY_USER}@${DEPLOY_HOST}:/tmp/site-${SITE}.tgz"
 
-          if [ $rc -ne 0 ]; then
-            echo "::error::rsync exited with code $rc"
-            case $rc in
-              23) echo "23 = partial transfer due to error (usually permission denied on target files)";;
-              12) echo "12 = protocol/data stream error";;
-              11) echo "11 = file I/O error";;
-              10) echo "10 = socket I/O error";;
-              5)  echo "5  = client-server protocol error";;
-              3)  echo "3  = errors selecting input files";;
-            esac
-            echo "--- target directory state ---"
-            ssh -o StrictHostKeyChecking=accept-new \
-              "${DEPLOY_USER}@${DEPLOY_HOST}" \
-              "ls -la /var/www/blog/ | head -20; echo; id" || true
-            exit $rc
-          fi
-          echo "rsync completed with exit code 0"
-
-      # www-data only needs read access. If an earlier deploy left the tree owned
-      # by another account, fix ownership -- but only on the directory entry
-      # (non-recursive) so the deploy user keeps write permission for next time.
-      - name: Ensure web server can read the tree
-        env:
-          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
-          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+      # 远端激活脚本单独上传成文件再执行。
+      #
+      # 为什么不在 "ssh ... \"set -e; ...\"" 里直接内联：
+      #   那会形成 YAML -> bash -> ssh 三层引号嵌套，$(mktemp)、$STAGE 之类
+      #   要在三种展开规则下同时正确，非常容易踩坑（本项目已因此出过多次问题）。
+      #   写成文件后，远端执行的只是一个无参数的脚本，没有转义风险。
+      #
+      # 为什么用 printf 逐行生成而不是 heredoc：
+      #   YAML 的 run: | 块内每一行都带前导缩进，heredoc 会把这些空格
+      #   一并写进脚本内容（<<- 才剥缩进，但也只剥 TAB）。printf 不受影响。
+      - name: Upload activate script
         run: |
-          ssh -o StrictHostKeyChecking=accept-new \
-            "${DEPLOY_USER}@${DEPLOY_HOST}" \
-            "sudo chown www-data:www-data /var/www/blog && sudo find /var/www/blog -type d -exec chmod 755 {} +"
-          echo "web root is readable by www-data"
+          printf '%s\n' \
+            'set -e' \
+            'SITE="$1"' \
+            'STAGE=$(mktemp -d)' \
+            'trap "rm -rf $STAGE" EXIT' \
+            'tar xzf "/tmp/site-${SITE}.tgz" -C "$STAGE"' \
+            'sudo /usr/local/bin/deploy-static-site "$SITE" "$STAGE"' \
+            'rm -f "/tmp/site-${SITE}.tgz"' \
+            > /tmp/activate.sh
+          echo "--- activate.sh ---"
+          cat /tmp/activate.sh
+          bash -n /tmp/activate.sh && echo "syntax ok"
+          scp -o StrictHostKeyChecking=accept-new \
+            /tmp/activate.sh \
+            "${DEPLOY_USER}@${DEPLOY_HOST}:/tmp/activate.sh"
+
+      - name: Activate deployment
+        run: |
+          ssh -o StrictHostKeyChecking=accept-new "${DEPLOY_USER}@${DEPLOY_HOST}" \
+            "bash /tmp/activate.sh ${SITE} && rm -f /tmp/activate.sh"
 
       # 真正的验证：把本次提交写入的标记文件从公网取回并核对。
       #
       # 为什么不只检查 HTTP 200：
-      #   站点早就上线了，HTTP 200 只能证明"站点活着"，
-      #   无法证明"本次 rsync 真的生效了"。那是假阳性。
+      #   站点早已上线，200 只能证明"站点活着"，
+      #   无法证明"本次部署真的生效了"。那是假阳性。
       #   核对 deployed.txt 里的 commit 才能证明整条链路打通。
       - name: Verify deployment
         run: |
@@ -151,7 +148,6 @@ jobs:
             sleep 5
           done
           echo "验证失败：线上 deployed.txt 未包含本次 commit"
-          echo "可能原因：rsync 目标路径错误、权限问题、或 CDN/浏览器缓存"
           exit 1
 
       - name: Summary
