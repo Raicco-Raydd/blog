@@ -137,3 +137,20 @@ body {
   color: var(--text);
   border-bottom-color: var(--text);
 }
+
+/* 法律条款与举报入口 */
+.site-links a {
+  color: var(--muted);
+  text-decoration: none;
+  border-bottom: 1px dotted var(--muted);
+}
+
+.site-links a:hover {
+  color: var(--text);
+  border-bottom-color: var(--text);
+}
+
+.site-links .sep {
+  opacity: 0.45;
+  margin: 0 0.35em;
+}
