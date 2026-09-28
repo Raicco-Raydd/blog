@@ -154,3 +154,13 @@ body {
   opacity: 0.45;
   margin: 0 0.35em;
 }
+
+/* 公安备案号：图标与编号一起链接至 beian.mps.gov.cn */
+.site-beian .sep {
+  opacity: 0.45;
+  margin: 0 0.35em;
+}
+
+.site-beian .beian-mps img {
+  border: 0;
+}
